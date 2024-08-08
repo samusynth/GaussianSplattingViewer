@@ -63,16 +63,18 @@ def _sort_gaussian_torch(gaus, view_mat):
 _sort_gaussian = None
 try:
     import torch
+    print("Torch successfully imported", flush=True)
     if not torch.cuda.is_available():
         raise ImportError
-    print("Detect torch cuda installed, will use torch as sorting backend")
+    print("Detect torch cuda installed, will use torch as sorting backend", flush=True)
     _sort_gaussian = _sort_gaussian_torch
 except ImportError:
     try:
         import cupy as cp
-        print("Detect cupy installed, will use cupy as sorting backend")
+        print("Detect cupy installed, will use cupy as sorting backend", flush=True)
         _sort_gaussian = _sort_gaussian_cupy
     except ImportError:
+        print("Using cpu sort", flush=True)
         _sort_gaussian = _sort_gaussian_cpu
 
 
