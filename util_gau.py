@@ -4,12 +4,53 @@ from dataclasses import dataclass
 import util
 import torch
 
-@dataclass
 class GaussianData6D:
     means: np.ndarray # 6d -> xyz world pos and xyz view dir
     covariances: np.ndarray # 6d covariance matrix
+
+    # Cached cuda intermediates
+    cuda_covariances_11: torch.Tensor
+    cuda_covariances_12: torch.Tensor
+    cuda_covariances_21: torch.Tensor
+    cuda_covariances_22: torch.Tensor
+    cuda_covariances_22_inv: torch.Tensor
+    cuda_covariances_regr: torch.Tensor
+    cuda_covariances_conditioned: torch.Tensor
+    cuda_covariances_conditioned_flat: torch.Tensor
+    cuda_means: torch.Tensor
+    cuda_opacities: torch.Tensor
+
+    covariances_conditioned_flat: np.ndarray
+
+
+
     colors: np.ndarray # 3d color
     opacities: np.ndarray # 1d opacity
+
+    def __init__(self, means, covariances, colors, opacities):
+        self.means = means
+        self.covariances = covariances
+        self.colors = colors
+        self.opacities = opacities
+
+        self.cuda_means = torch.tensor(self.means, device='cuda')
+        self.cuda_opacities = torch.tensor(self.opacities, device='cuda')
+
+        condition_dim = 3
+        # taken from section 2 of https://www.sdiolatz.info/ndg-fitting/static/files/ndg-supp.pdf
+        # todo: this can be done in a shader instead for much faster perf
+        covariances = torch.tensor(self.covariances, device='cuda')
+        self.cuda_covariances_11 = covariances[:, :condition_dim, :condition_dim]
+        self.cuda_covariances_12 = covariances[:, :condition_dim, condition_dim:]
+        self.cuda_covariances_21 = covariances[:, condition_dim:, :condition_dim]
+        self.cuda_covariances_22 = covariances[:, condition_dim:, condition_dim:]
+
+        self.cuda_covariances_22_inv = self.cuda_covariances_22.inverse()
+        self.cuda_covariances_regr = torch.bmm(self.cuda_covariances_12, self.cuda_covariances_22_inv)
+        self.cuda_covariances_conditioned = self.cuda_covariances_11 - torch.bmm(self.cuda_covariances_regr, self.cuda_covariances_21)
+        self.cuda_covariances_conditioned_flat = self.cuda_covariances_conditioned.flatten(start_dim=1)
+        self.covariances_conditioned_flat = self.cuda_covariances_conditioned_flat.cpu().numpy()
+
     def flat(self) -> np.ndarray:
         ret = np.concatenate([self.means, self.covariances, self.colors, self.opacities], axis=-1)
         return np.ascontiguousarray(ret)
@@ -17,47 +58,31 @@ class GaussianData6D:
         return len(self.means)
     
     def to_gaussian3d(self, camera: util.Camera):
-        print("Starting math")
-        tmeans = torch.tensor(self.means, device='cuda')
+        #print("Starting math")
         camera_pos = torch.tensor(camera.position, device='cuda')
-        view_directions = tmeans[:, :3] - camera_pos
+        view_directions = self.cuda_means[:, :3] - camera_pos
         view_directions_unit = view_directions / view_directions.norm(dim=1, keepdim=True)
 
+       
         condition_dim = 3
-
-        # taken from section 2 of https://www.sdiolatz.info/ndg-fitting/static/files/ndg-supp.pdf
-        # todo: this can be done in a shader instead for much faster perf
-        covariances = torch.tensor(self.covariances, device='cuda')
-        covariances_11 = covariances[:, :condition_dim, :condition_dim]
-        covariances_12 = covariances[:, :condition_dim, condition_dim:]
-        covariances_21 = covariances[:, condition_dim:, :condition_dim]
-        covariances_22 = covariances[:, condition_dim:, condition_dim:]
-
-        covariances_22_inv = covariances_22.inverse()
-
-        covariances_regr = torch.bmm(covariances_12, covariances_22_inv)
-
-        means = torch.tensor(self.means, device='cuda')
-        means_1 = means[:, :condition_dim]
-        means_2 = means[:, condition_dim:]
+        means_1 = self.cuda_means[:, :condition_dim]
+        means_2 = self.cuda_means[:, condition_dim:]
         x = view_directions_unit-means_2
 
-        pdf_conditioned = torch.exp(-torch.abs(torch.bmm(torch.bmm(x.unsqueeze(-2), covariances_22_inv), x.unsqueeze(-1))))[:, :, 0]
-        means_conditioned = means_1 + torch.bmm(covariances_regr, x.unsqueeze(-1))[:, :, 0]
-        covariances_conditioned = covariances_11 - torch.bmm(covariances_regr, covariances_21)
+        pdf_conditioned = torch.exp(-torch.abs(torch.bmm(torch.bmm(x.unsqueeze(-2), self.cuda_covariances_22_inv), x.unsqueeze(-1))))[:, :, 0]
+        means_conditioned = means_1 + torch.bmm(self.cuda_covariances_regr, x.unsqueeze(-1))[:, :, 0]
         # flatten so it can be concatenated later in numpy
-        covariances_conditioned_flat = covariances_conditioned.flatten(start_dim=1)
-        opacities_conditioned = torch.tensor(self.opacities, device='cuda') * pdf_conditioned
+        opacities_conditioned = self.cuda_opacities * pdf_conditioned
         
 
-        print(f"pdf conditioned shape: {pdf_conditioned.shape}")
-        print(f"means conditioned shape: {means_conditioned.shape}")
-        print(f"covariance conditioned shape: {covariances_conditioned.shape}")
-        print(f"opacities conditioned shape: {opacities_conditioned.shape}")
+        #print(f"pdf conditioned shape: {pdf_conditioned.shape}")
+        #print(f"means conditioned shape: {means_conditioned.shape}")
+        #print(f"covariance conditioned shape: {self.cuda_covariances_conditioned.shape}")
+        #print(f"opacities conditioned shape: {opacities_conditioned.shape}")
 
-        return GaussianData3D(means_conditioned.cpu().numpy(), covariances_conditioned_flat.cpu().numpy(), self.colors, opacities_conditioned.cpu().numpy())
+        #print("Done with math")
+        return GaussianData3D(means_conditioned.cpu().numpy(), self.covariances_conditioned_flat, self.colors, opacities_conditioned.cpu().numpy())
 
-        print("Done with math")
 
         # view_directions = self.means[:, :3] - np.asarray(camera.position)
         # view_directions_unit = view_directions / np.linalg.norm(view_directions, axis=1, keepdims=True)
