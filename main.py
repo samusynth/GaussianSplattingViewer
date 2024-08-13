@@ -145,11 +145,16 @@ def main():
     g_renderer = g_renderer_list[g_renderer_idx]
 
     # gaussian data
-    gaussians = util_gau.naive_gaussian()
-    update_activated_renderer_state(gaussians)
+    gaussians3d = None
+    gaussians6d = None
+    # update_activated_renderer_state(gaussians)
     
     # settings
     while not glfw.window_should_close(window):
+        if gaussians6d:
+            gaussians3d = gaussians6d.to_gaussian3d(g_camera)
+            g_renderer.update_gaussian_data(gaussians3d)
+
         glfw.poll_events()
         impl.process_inputs()
         imgui.new_frame()
@@ -181,9 +186,9 @@ def main():
             if imgui.begin("Control", True):
                 # rendering backend
                 changed, g_renderer_idx = imgui.combo("backend", g_renderer_idx, ["ogl", "cuda"][:len(g_renderer_list)])
-                if changed:
+                if changed and gaussians3d:
                     g_renderer = g_renderer_list[g_renderer_idx]
-                    update_activated_renderer_state(gaussians)
+                    update_activated_renderer_state(gaussians3d)
 
                 imgui.text(f"fps = {imgui.get_io().framerate:.1f}")
 
@@ -191,7 +196,7 @@ def main():
                         "reduce updates", g_renderer.reduce_updates,
                     )
 
-                imgui.text(f"# of Gaus = {len(gaussians)}")
+                imgui.text(f"# of Gaus = {len(gaussians3d) if gaussians3d else 0}")
                 if imgui.button(label='open ply'):
                     file_path = filedialog.askopenfilename(title="open ply",
                         initialdir="C:\\Users\\MSI_NB\\Downloads\\viewers",
@@ -199,8 +204,9 @@ def main():
                         )
                     if file_path:
                         try:
-                            gaussians = util_gau.load_ply(file_path)
-                            g_renderer.update_gaussian_data(gaussians)
+                            gaussians6d = util_gau.load_ply_6d(file_path)
+                            gaussians3d = gaussians6d.to_gaussian3d(g_camera)
+                            g_renderer.update_gaussian_data(gaussians3d)
                             g_renderer.sort_and_update(g_camera)
                         except RuntimeError as e:
                             pass

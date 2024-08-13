@@ -1,6 +1,105 @@
 import numpy as np
 from plyfile import PlyData
 from dataclasses import dataclass
+import util
+import torch
+
+@dataclass
+class GaussianData6D:
+    means: np.ndarray # 6d -> xyz world pos and xyz view dir
+    covariances: np.ndarray # 6d covariance matrix
+    colors: np.ndarray # 3d color
+    opacities: np.ndarray # 1d opacity
+    def flat(self) -> np.ndarray:
+        ret = np.concatenate([self.means, self.covariances, self.colors, self.opacities], axis=-1)
+        return np.ascontiguousarray(ret)
+    def __len__(self):
+        return len(self.means)
+    
+    def to_gaussian3d(self, camera: util.Camera):
+        print("Starting math")
+        tmeans = torch.tensor(self.means, device='cuda')
+        camera_pos = torch.tensor(camera.position, device='cuda')
+        view_directions = tmeans[:, :3] - camera_pos
+        view_directions_unit = view_directions / view_directions.norm(dim=1, keepdim=True)
+
+        condition_dim = 3
+
+        # taken from section 2 of https://www.sdiolatz.info/ndg-fitting/static/files/ndg-supp.pdf
+        # todo: this can be done in a shader instead for much faster perf
+        covariances = torch.tensor(self.covariances, device='cuda')
+        covariances_11 = covariances[:, :condition_dim, :condition_dim]
+        covariances_12 = covariances[:, :condition_dim, condition_dim:]
+        covariances_21 = covariances[:, condition_dim:, :condition_dim]
+        covariances_22 = covariances[:, condition_dim:, condition_dim:]
+
+        covariances_22_inv = covariances_22.inverse()
+
+        covariances_regr = torch.bmm(covariances_12, covariances_22_inv)
+
+        means = torch.tensor(self.means, device='cuda')
+        means_1 = means[:, :condition_dim]
+        means_2 = means[:, condition_dim:]
+        x = view_directions_unit-means_2
+
+        pdf_conditioned = torch.exp(-torch.abs(torch.bmm(torch.bmm(x.unsqueeze(-2), covariances_22_inv), x.unsqueeze(-1))))[:, :, 0]
+        means_conditioned = means_1 + torch.bmm(covariances_regr, x.unsqueeze(-1))[:, :, 0]
+        covariances_conditioned = covariances_11 - torch.bmm(covariances_regr, covariances_21)
+        # flatten so it can be concatenated later in numpy
+        covariances_conditioned_flat = covariances_conditioned.flatten(start_dim=1)
+        opacities_conditioned = torch.tensor(self.opacities, device='cuda') * pdf_conditioned
+        
+
+        print(f"pdf conditioned shape: {pdf_conditioned.shape}")
+        print(f"means conditioned shape: {means_conditioned.shape}")
+        print(f"covariance conditioned shape: {covariances_conditioned.shape}")
+        print(f"opacities conditioned shape: {opacities_conditioned.shape}")
+
+        return GaussianData3D(means_conditioned.cpu().numpy(), covariances_conditioned_flat.cpu().numpy(), self.colors, opacities_conditioned.cpu().numpy())
+
+        print("Done with math")
+
+        # view_directions = self.means[:, :3] - np.asarray(camera.position)
+        # view_directions_unit = view_directions / np.linalg.norm(view_directions, axis=1, keepdims=True)
+
+        # condition_dim = 3
+
+        # # taken from section 2 of https://www.sdiolatz.info/ndg-fitting/static/files/ndg-supp.pdf
+        # # todo: this can be done in a shader instead for much faster perf
+        # covariances_11 = self.covariances[:, :condition_dim, :condition_dim]
+        # covariances_12 = self.covariances[:, :condition_dim, condition_dim:]
+        # covariances_21 = self.covariances[:, condition_dim:, :condition_dim]
+        # covariances_22 = self.covariances[:, condition_dim:, condition_dim:]
+
+        # covariances_22_inv = np.linalg.inv(covariances_22)
+
+        # covariances_regr = np.matmul(covariances_12, covariances_22_inv)
+
+        # means_1 = self.means[:, :condition_dim]
+        # means_2 = self.means[:, condition_dim:]
+        # x = view_directions_unit-means_2
+        # print(x, flush=True)
+
+        # pdf_cond = np.exp(-np.abs(np.matmul(np.matmul(x.unsqueeze(-2), covariances_22_inv), x.unsqueeze(-1))))[:, :, 0]
+
+        # m_cond = means_1 + np.matmul(covariances_regr, x.unsqueeze(-1))[:, :, 0]
+        # covariances_cond = covariances_11 - torch.bmm(covariances_regr, covariances_21)
+
+
+    
+
+@dataclass
+class GaussianData3D:
+    xyz: np.ndarray
+    cov3d: np.ndarray
+    colors: np.ndarray
+    opacity: np.ndarray
+    def flat(self) -> np.ndarray:
+        ret = np.concatenate([self.xyz, self.cov3d, self.colors, self.opacity], axis=-1)
+        return np.ascontiguousarray(ret)
+    
+    def __len__(self):
+        return len(self.xyz)
 
 @dataclass
 class GaussianData:
@@ -56,7 +155,29 @@ def naive_gaussian():
         gau_s,
         gau_a,
         gau_c
-    )
+    )    
+
+def load_ply_6d(path):
+    plydata = PlyData.read(path)
+    vertex_data = plydata['vertex'].data
+    means = np.stack((np.asarray(plydata.elements[0]["m_0"]),
+                      np.asarray(plydata.elements[0]["m_1"]),
+                      np.asarray(plydata.elements[0]["m_2"]),
+                      np.asarray(plydata.elements[0]["m_3"]),
+                      np.asarray(plydata.elements[0]["m_4"]),
+                      np.asarray(plydata.elements[0]["m_5"])), axis=1)
+    opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+
+    # extract 6d covariance matrices into (num_gaussians, 6, 6) shape np array
+    cov_keys = [f'cov_{i}_{j}' for i in range(6) for j in range(6)]
+    cov_values = np.array([vertex_data[key] for key in cov_keys]).T
+    covariances = cov_values.reshape(-1, 6, 6)
+    colors = np.stack((np.asarray(plydata.elements[0]["f_0"]),
+                      np.asarray(plydata.elements[0]["f_1"]),
+                      np.asarray(plydata.elements[0]["f_2"])), axis=1)
+    
+    return GaussianData6D(means, covariances, colors, opacities)
+
 
 
 def load_ply(path):
@@ -108,6 +229,8 @@ def load_ply(path):
     return GaussianData(xyz, rots, scales, opacities, shs)
 
 if __name__ == "__main__":
-    gs = load_ply("C:\\Users\\MSI_NB\\Downloads\\viewers\\models\\train\\point_cloud\\iteration_7000\\point_cloud.ply")
-    a = gs.flat()
-    print(a.shape)
+    gs = load_ply_6d("C:\\Users\\samue\\Workspace\\ndg-fitting\\models\\splatting\\20240802-181703\\point_cloud10000.ply")
+    gs3d = gs.to_gaussian3d(util.Camera(720, 1080))
+    flat = gs3d.flat()
+    print(flat.shape)
+    print(flat)

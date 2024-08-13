@@ -124,7 +124,7 @@ class OpenGLRenderer(GaussianRenderBase):
     def __init__(self, w, h):
         super().__init__()
         gl.glViewport(0, 0, w, h)
-        self.program = util.load_shaders('shaders/gau_vert.glsl', 'shaders/gau_frag.glsl')
+        self.program = util.load_shaders('shaders/gau_vert_ndg.vert', 'shaders/gau_frag.frag')
 
         # Vertex data for a quad
         self.quad_v = np.array([
@@ -157,14 +157,14 @@ class OpenGLRenderer(GaussianRenderBase):
         else:
             print("VSync is not supported")
 
-    def update_gaussian_data(self, gaus: util_gau.GaussianData):
+    def update_gaussian_data(self, gaus: util_gau.GaussianData3D):
         self.gaussians = gaus
         # load gaussian geometry
         gaussian_data = gaus.flat()
         self.gau_bufferid = util.set_storage_buffer_data(self.program, "gaussian_data", gaussian_data, 
                                                          bind_idx=0,
                                                          buffer_id=self.gau_bufferid)
-        util.set_uniform_1int(self.program, gaus.sh_dim, "sh_dim")
+        #util.set_uniform_1int(self.program, gaus.sh_dim, "sh_dim")
 
     def sort_and_update(self, camera: util.Camera):
         index = _sort_gaussian(self.gaussians, camera.get_view_matrix())
@@ -195,5 +195,5 @@ class OpenGLRenderer(GaussianRenderBase):
     def draw(self):
         gl.glUseProgram(self.program)
         gl.glBindVertexArray(self.vao)
-        num_gau = len(self.gaussians)
+        num_gau = len(self.gaussians) if self.gaussians else 0
         gl.glDrawElementsInstanced(gl.GL_TRIANGLES, len(self.quad_f.reshape(-1)), gl.GL_UNSIGNED_INT, None, num_gau)
